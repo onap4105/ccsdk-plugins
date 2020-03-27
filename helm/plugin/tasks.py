@@ -1,7 +1,6 @@
 # ============LICENSE_START==========================================
 # ===================================================================
 # Copyright (c) 2018 AT&T
-# Copyright (c) 2020 Pantheon.tech. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +15,7 @@
 # limitations under the License.
 # ============LICENSE_END============================================
 
+from cloudify.decorators import operation
 import shutil
 import errno
 import sys
@@ -25,33 +25,39 @@ import os
 import re
 import getpass
 import subprocess
+from cloudify import ctx
+from cloudify.exceptions import OperationRetry
+from cloudify_rest_client.exceptions import CloudifyClientError
+import pip
 import json
 import base64
 import yaml
-try:
-    from urllib.request import Request, urlopen
-except ImportError:
-    from urllib2 import Request, urlopen
-
-from cloudify import ctx
-from cloudify import exceptions
+import urllib2
 from cloudify.decorators import operation
-from cloudify.exceptions import OperationRetry
+from cloudify import exceptions
 from cloudify.exceptions import NonRecoverableError
-from cloudify_rest_client.exceptions import CloudifyClientError
+from cloudify import ctx, manager
 
-
-def debug_log_mask_credentials(_command_str):
+# Mask sensitive data in logs
+def m_logger(_command_str):
+    """
+    mask the username and password in log 
+    """
     debug_str = _command_str
-    if _command_str.find("@") != -1:
-        head, end = _command_str.rsplit('@', 1)
-        proto, auth = head.rsplit('//', 1)
-        uname, passwd = auth.rsplit(':', 1)
-        debug_str = _command_str.replace(passwd, "************")
-    ctx.logger.debug('command {0}.'.format(debug_str))
+    cmd_list=debug_str.split()
+    i = 0
+    sizeofList = len(cmd_list)
+    while i < sizeofList :
+       if cmd_list[i] == '--username' or cmd_list[i] == '--password':
+          i += 1
+          cmd_list[i] = "***********"
+       i += 1
+    debug_msg = '  '.join(cmd_list)
+    ctx.logger.debug('DEBUG {0}.'.format(debug_msg))
 
+# ececute a helm command
 def execute_command(_command):
-    debug_log_mask_credentials(_command)
+    m_logger(_command)
 
     subprocess_args = {
         'args': _command.split(),
@@ -59,7 +65,7 @@ def execute_command(_command):
         'stderr': subprocess.PIPE
     }
 
-    debug_log_mask_credentials(str(subprocess_args))
+    # m_logger(str(subprocess_args))
     try:
         process = subprocess.Popen(**subprocess_args)
         output, error = process.communicate()
@@ -67,17 +73,28 @@ def execute_command(_command):
         ctx.logger.debug(str(e))
         return False
 
-    debug_log_mask_credentials(_command)
-    ctx.logger.debug('output: {0} '.format(output))
-    ctx.logger.debug('error: {0} '.format(error))
+    # m_logger(_command)
     ctx.logger.debug('process.returncode: {0} '.format(process.returncode))
 
     if process.returncode:
         ctx.logger.error('Error was returned while running helm command')
+        m_logger(output)
+        m_logger(error)
         return False
 
     return output
 
+# get secret from cfy secret
+def get_secret(secret_key):
+    try: 
+        client = manager.get_rest_client() 
+        secret_dict = client.secrets.get(secret_key) 
+	 
+        ctx.logger.debug('Got secret for key={0}'.format(secret_key))
+        return secret_dict["value"] 
+    except Exception as e: 
+        ctx.logger.debug(str(e))
+        raise NonRecoverableError("Unable to get secret")
 
 def configure_admin_conf():
     # Add the kubeadmin config to environment
@@ -96,43 +113,44 @@ def configure_admin_conf():
         outfile.write('export KUBECONFIG=$HOME/admin.conf')
     os.environ['KUBECONFIG'] = admin_file_dest
 
-
+# helm values get
 def get_current_helm_value(chart_name):
-    tiller_host = str(ctx.node.properties['tiller_ip']) + ':' + str(
-        ctx.node.properties['tiller_port'])
+    namespace = ctx.node.properties['namespace']
     config_dir_root = str(ctx.node.properties['config_dir'])
     config_dir = config_dir_root + str(ctx.deployment.id) + '/'
+    k8s_kubecofig = config_dir + '/kube.config'
     if str_to_bool(ctx.node.properties['tls_enable']):
         getValueCommand = subprocess.Popen(
-            ["helm", "get", "values", "-a", chart_name, '--host', tiller_host,
+            ["helm3", "get", "values", "-a", chart_name,
              '--tls', '--tls-ca-cert', config_dir + 'ca.cert.pem',
              '--tls-cert',
              config_dir + 'helm.cert.pem', '--tls-key',
              config_dir + 'helm.key.pem'], stdout=subprocess.PIPE)
     else:
         getValueCommand = subprocess.Popen(
-            ["helm", "get", "values", "-a", chart_name, '--host', tiller_host],
+            ["helm3", "get", "values", "-a", chart_name, "-n", namespace, 
+             "--kubeconfig", k8s_kubecofig],
             stdout=subprocess.PIPE)
     value = getValueCommand.communicate()[0]
     valueMap = {}
     valueMap = yaml.safe_load(value)
     ctx.instance.runtime_properties['current-helm-value'] = valueMap
 
-
+# helm history
 def get_helm_history(chart_name):
-    tiller_host = str(ctx.node.properties['tiller_ip']) + ':' + str(
-        ctx.node.properties['tiller_port'])
+    namespace = ctx.node.properties['namespace']
     config_dir_root = str(ctx.node.properties['config_dir'])
     config_dir = config_dir_root + str(ctx.deployment.id) + '/'
+    k8s_kubecofig = config_dir + '/kube.config'
     if str_to_bool(ctx.node.properties['tls_enable']):
         getHistoryCommand = subprocess.Popen(
-            ["helm", "history", chart_name, '--host', tiller_host, '--tls',
+            ["helm3", "history", chart_name, '--tls',
              '--tls-ca-cert', config_dir + 'ca.cert.pem', '--tls-cert',
              config_dir + 'helm.cert.pem', '--tls-key',
              config_dir + 'helm.key.pem'], stdout=subprocess.PIPE)
     else:
         getHistoryCommand = subprocess.Popen(
-            ["helm", "history", chart_name, '--host', tiller_host],
+            ["helm3", "history", chart_name, "-n", namespace, "--kubeconfig", k8s_kubecofig],
             stdout=subprocess.PIPE)
     history = getHistoryCommand.communicate()[0]
     history_start_output = [line.strip() for line in history.split('\n') if
@@ -142,6 +160,26 @@ def get_helm_history(chart_name):
                                                                           ' ')
     ctx.instance.runtime_properties['helm-history'] = history_start_output
 
+# populate kubeconfig
+def get_helm_kubeconfig(wf):
+    kubeconfig_token_key = str(ctx.node.properties['kubeconfig_token_key'])
+    certificate_authority_data_key = str(ctx.node.properties['kubeconfig_ca_key'])
+    client_certificate_data_key = str(ctx.node.properties['kubeconfig_cert_key'])
+    client_key_data_key = str(ctx.node.properties['kubeconfig_key_key'])
+    k8s_configuration = ctx.node.properties['configuration']
+    k8s_configuration_obj = {}
+    k8s_configuration_obj = k8s_configuration.get('file_content', '')
+
+    if wf != 'install':
+        # use the latest token/cert values
+        if kubeconfig_token_key == 'platform':
+            k8s_configuration_obj['clusters'][0]['cluster']['certificate-authority-data'] = get_secret(certificate_authority_data_key)
+            k8s_configuration_obj['users'][0]['user']['client-certificate-data'] = get_secret(client_certificate_data_key)
+            k8s_configuration_obj['users'][0]['user']['client-key-data'] = get_secret(client_key_data_key)
+        else:
+            k8s_configuration_obj['users'][0]['user']['token'] = get_secret(kubeconfig_token_key)
+
+    return k8s_configuration_obj
 
 def tls():
     if str_to_bool(ctx.node.properties['tls_enable']):
@@ -156,15 +194,6 @@ def tls():
     else:
         return ''
 
-
-def tiller_host():
-    tiller_host = ' --host ' + str(
-        ctx.node.properties['tiller_ip']) + ':' + str(
-        ctx.node.properties['tiller_port']) + ' '
-    ctx.logger.debug(tiller_host)
-    return tiller_host
-
-
 def str_to_bool(s):
     s = str(s)
     if s == 'True' or s == 'true':
@@ -172,7 +201,7 @@ def str_to_bool(s):
     elif s == 'False' or s == 'false':
         return False
     else:
-        raise ValueError('Require [Tt]rue or [Ff]alse; got: {0}'.format(s))
+        raise False
 
 
 def get_config_json(config_json, config_path, config_opt_f, config_file_nm):
@@ -190,18 +219,18 @@ def pop_config_info(url, config_file, f_format, repo_user, repo_user_passwd):
         head, auth = head.rsplit('//', 1)
         url = head + '//' + end
         username, password = auth.rsplit(':', 1)
-        request = Request(url)
+        request = urllib2.Request(url)
         base64string = base64.encodestring(
             '%s:%s' % (username, password)).replace('\n', '')
         request.add_header("Authorization", "Basic %s" % base64string)
-        response = urlopen(request)
+        response = urllib2.urlopen(request)
     elif repo_user != '' and repo_user_passwd != '':
-        request = Request(url)
+        request = urllib2.Request(url)
         base64string = base64.b64encode('%s:%s' % (repo_user, repo_user_passwd))
         request.add_header("Authorization", "Basic %s" % base64string)
-        response = urlopen(request)
+        response = urllib2.urlopen(request)
     else:
-        response = urlopen(url)
+        response = urllib2.urlopen(url)
 
     config_obj = {}
     if f_format == 'json':
@@ -220,8 +249,7 @@ def gen_config_file(config_file, config_obj):
             yaml.safe_dump(config_obj, outfile, default_flow_style=False)
     except OSError as e:
         if e.errno != errno.EEXIST:
-            raise
-
+            raise NonRecoverableError("Unable to create kube.config.")
 
 def gen_config_str(config_file, config_opt_f):
     try:
@@ -265,13 +293,9 @@ def opt(config_file):
     return opt_str
 
 def repo(repo_url, repo_user, repo_user_passwd):
-    if repo_user != '' and repo_user_passwd != '' and repo_url.find("@") == -1:
-        proto, ip = repo_url.rsplit('//', 1)
-        return proto + '//' + repo_user + ':' + repo_user_passwd + '@' + ip
-    else:
-        return repo_url
+    return repo_url + ' --username ' + repo_user + ' --password ' + repo_user_passwd 
 
-
+# setup helm runtime configuration
 @operation
 def config(**kwargs):
     # create helm value file on K8s master
@@ -285,7 +309,8 @@ def config(**kwargs):
     config_opt_set = str(ctx.node.properties['config_set'])
     repo_user = str(ctx.node.properties['repo_user'])
     repo_user_passwd = str(ctx.node.properties['repo_user_password'])
-    ctx.logger.debug("debug " + configJson + runtime_config)
+    ctx.logger.debug("=> " + configJson + runtime_config)
+
     # load input config
     config_dir = config_dir_root + str(ctx.deployment.id)
 
@@ -329,6 +354,12 @@ def config(**kwargs):
         if e.errno != errno.EEXIST:
             raise
 
+    ctx.logger.debug("creating kubeconfig")
+    k8s_configuration_obj = get_helm_kubeconfig('install')
+        
+    k8s_kubecofig = config_dir + '/kube.config'
+    gen_config_file(k8s_kubecofig, k8s_configuration_obj)
+
     config_opt_f = ""
     if configJson == '' and configUrl == '':
         ctx.logger.debug("Will use default HELM value")
@@ -354,12 +385,7 @@ def config(**kwargs):
         config_opt_set = " --set " + config_opt_set
         gen_config_str(config_file, config_opt_set)
 
-    output = execute_command(
-        'helm init --client-only --stable-repo-url ' + repo(stable_repo_url, repo_user, repo_user_passwd))
-    if output == False:
-        raise NonRecoverableError("helm init failed")
-
-
+# install a helm chart
 @operation
 def start(**kwargs):
     # install the ONAP Helm chart
@@ -371,16 +397,22 @@ def start(**kwargs):
     chartVersion = str(ctx.node.properties['chart_version'])
     config_dir_root = str(ctx.node.properties['config_dir'])
     namespace = ctx.node.properties['namespace']
+    release_name = str(ctx.node.properties['release_name'])
 
     config_path = config_dir_root + str(
         ctx.deployment.id) + '/' + componentName + '/'
     chart = chartRepo + "/" + componentName + "-" + str(chartVersion) + ".tgz"
     chartName = namespace + "-" + componentName
+    if release_name != 'default_release_name':
+        chartName = release_name
+
     config_file = config_path + ".config_file"
     config_set = config_path + ".config_set"
-    installCommand = 'helm install ' + repo(chart, repo_user, repo_user_passwd) + ' --name ' + chartName + \
+    kubeconfig_k8s =config_dir_root + str( ctx.deployment.id) + '/kube.config'
+    installCommand = 'helm3 install ' + chartName + ' ' + repo(chart, repo_user, repo_user_passwd) + \
                      ' --namespace ' + namespace + opt(config_file) + \
-                     opt(config_set) + tiller_host() + tls()
+                     opt(config_set) + tls() + ' --kubeconfig ' + kubeconfig_k8s
+
 
     output = execute_command(installCommand)
     if output == False:
@@ -391,7 +423,7 @@ def start(**kwargs):
     get_current_helm_value(chartName)
     get_helm_history(chartName)
 
-
+# uninstall the deployed release
 @operation
 def stop(**kwargs):
     # delete the ONAP helm chart
@@ -399,10 +431,21 @@ def stop(**kwargs):
     # get properties from node
     namespace = ctx.node.properties['namespace']
     component = ctx.node.properties['component_name']
+    release_name = str(ctx.node.properties['release_name'])
     chartName = namespace + "-" + component
+    if release_name != 'default_release_name':
+        chartName = release_name
+
     config_dir_root = str(ctx.node.properties['config_dir'])
+    kubeconfig_k8s =config_dir_root + str( ctx.deployment.id) + '/kube.config'
+
+    ctx.logger.debug("creating kubeconfig")
+    k8s_configuration_obj = get_helm_kubeconfig('stop')
+    gen_config_file(kubeconfig_k8s, k8s_configuration_obj)
+
     # Delete helm chart
-    command = 'helm delete --purge ' + chartName + tiller_host() + tls()
+    command = 'helm3 uninstall ' + chartName + tls() + ' -n ' + \
+            namespace + ' --kubeconfig ' + kubeconfig_k8s
     output = execute_command(command)
     if output == False:
         raise NonRecoverableError("helm delete failed")
@@ -412,7 +455,8 @@ def stop(**kwargs):
     if os.path.exists(config_path):
         shutil.rmtree(config_path)
 
-
+# upgrades a release to a new version of a chart
+# override values in a chart
 @operation
 def upgrade(**kwargs):
     config_dir_root = str(ctx.node.properties['config_dir'])
@@ -429,10 +473,18 @@ def upgrade(**kwargs):
     config_format = kwargs['config_format']
     config_path = config_dir_root + str(
         ctx.deployment.id) + '/' + componentName + '/'
+    release_name = str(ctx.node.properties['release_name'])
 
     # ctx.logger.debug('debug ' + str(configJson))
     chartName = namespace + "-" + componentName
+    if release_name != 'default_release_name':
+        chartName = release_name
+
     chart = chartRepo + "/" + componentName + "-" + chartVersion + ".tgz"
+    kubeconfig_k8s =config_dir_root + str( ctx.deployment.id) + '/kube.config'
+    ctx.logger.debug("creating kubeconfig")
+    k8s_configuration_obj = get_helm_kubeconfig('upgrade')
+    gen_config_file(kubeconfig_k8s, k8s_configuration_obj)
 
     config_opt_f = ""
     if config_json == '' and config_url == '':
@@ -455,8 +507,14 @@ def upgrade(**kwargs):
         config_opt_set = " --set " + config_set
         gen_config_str(config_upd_set, config_opt_set)
 
-    upgradeCommand = 'helm upgrade ' + chartName + ' ' + repo(chart, repo_user, repo_user_passwd) + opt(config_upd) + \
-                         opt(config_upd_set) + tiller_host() + tls()
+    upgradeCommand = 'helm3 upgrade ' + \
+                     chartName + ' ' + \
+                     repo(chart, repo_user, repo_user_passwd) + \
+                     opt(config_upd) + \
+                     opt(config_upd_set) + \
+                     tls() + \
+                     ' --namespace ' + namespace + \
+                     ' --kubeconfig ' + kubeconfig_k8s
 
     output = execute_command(upgradeCommand)
     if output == False:
@@ -466,16 +524,31 @@ def upgrade(**kwargs):
     get_current_helm_value(chartName)
     get_helm_history(chartName)
 
-
+# roll back a release to a previous revision
 @operation
 def rollback(**kwargs):
     # rollback to some revision
+    config_dir_root = str(ctx.node.properties['config_dir'])
     componentName = ctx.node.properties['component_name']
     namespace = ctx.node.properties['namespace']
+    release_name = str(ctx.node.properties['release_name'])
     revision = kwargs['revision']
     # configure_admin_conf()
     chartName = namespace + "-" + componentName
-    rollbackCommand = 'helm rollback ' + chartName + ' ' + revision + tiller_host() + tls()
+    if release_name != 'default_release_name':
+        chartName = release_name
+
+    kubeconfig_k8s =config_dir_root + str( ctx.deployment.id) + '/kube.config'
+    ctx.logger.debug("creating kubeconfig")
+    k8s_configuration_obj = get_helm_kubeconfig('rollback')
+    gen_config_file(kubeconfig_k8s, k8s_configuration_obj)
+
+    rollbackCommand = 'helm3 rollback ' + \
+                      chartName + ' ' + \
+                      revision + \
+                      tls() + \
+                      ' --namespace ' + namespace + \
+                      ' --kubeconfig ' + kubeconfig_k8s
     output = execute_command(rollbackCommand)
     if output == False:
         return ctx.operation.retry(
@@ -484,13 +557,31 @@ def rollback(**kwargs):
     get_current_helm_value(chartName)
     get_helm_history(chartName)
 
+# Use helm plugin 'fullstatus', it extends 'helm status' with the status of the kubernetes resources
+# that have been deployed through the specified helm release. It behaves similarly to how 
+# 'helm2 status' behaves
 @operation
 def status(**kwargs):
+    config_dir_root = str(ctx.node.properties['config_dir'])
     componentName = ctx.node.properties['component_name']
     namespace = ctx.node.properties['namespace']
+    release_name = str(ctx.node.properties['release_name'])
+    kubeconfig_k8s =config_dir_root + str( ctx.deployment.id) + '/kube.config'
+
+    ctx.logger.debug("creating kubeconfig")
+    k8s_configuration_obj = get_helm_kubeconfig('status')
+    gen_config_file(kubeconfig_k8s, k8s_configuration_obj)
 
     chartName = namespace + "-" + componentName
-    statusCommand = 'helm status ' + chartName + tiller_host() + tls()
+    if release_name != 'default_release_name':
+        chartName = release_name
+
+    statusCommand = 'helm3 fullstatus ' + \
+                     chartName + \
+                     ' -n ' + namespace + \
+                     tls() + \
+                     ' --kubeconfig ' + kubeconfig_k8s
+
     output = execute_command(statusCommand)
     if output == False:
         return ctx.operation.retry(

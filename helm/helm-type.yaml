@@ -19,20 +19,25 @@ plugins:
   helm-plugin:
     executor: central_deployment_agent
     package_name: helm
-    package_version: 4.1.0
+    package_version: 5.0.2
+
+data_types:
+  onap.types.ConfigurationVariant:
+    description: >
+      Type representing all Kubernetes API configuration variants.
+      Each property represents separate supported variant of configuration.
+      You should choose one variant and fill in only on property.
+    properties:
+      file_content:
+        required: true
+        description: >
+          Content (YAML) of Kubernetes configuration file
 
 node_types:
 
   onap.nodes.component:
     derived_from: cloudify.nodes.Root
     properties:
-      tiller_ip:
-        description: IP of tiller server
-        type: string
-      tiller_port:
-        default: local
-        description: Port of tiller server
-        type: string
       chart_repo_url:
         default: local
         description: helm chart repo url
@@ -46,6 +51,10 @@ node_types:
       config_dir:
         description: config file dir
         default: '/opt/manager/resources/'
+        type: string
+      release_name:
+        description: helm release name 
+        default: 'default_release_name'
         type: string
       namespace:
         description: k8s namespace
@@ -96,6 +105,25 @@ node_types:
         description:  chart repo user password 
         type: string
         default: ''
+      configuration:
+        type: onap.types.ConfigurationVariant
+        description: Content of Kubernetes config file (YAML)
+      kubeconfig_token_key:
+        description:  cfy secret key 
+        type: string
+        default: 'platform'
+      kubeconfig_ca_key:
+        description:  cfy secret key 
+        type: string
+        default: 'kp-kubernetes_certificate_authority_data'
+      kubeconfig_cert_key:
+        description:  cfy secret key 
+        type: string
+        default: 'kp-kubernetes-admin_client_certificate_data'
+      kubeconfig_key_key:
+        description:  cfy secret key 
+        type: string
+        default: 'kp-kubernetes-admin_client_key_data'
 
     interfaces:
       cloudify.interfaces.lifecycle:
